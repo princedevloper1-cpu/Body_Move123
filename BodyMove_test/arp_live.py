@@ -6,6 +6,7 @@ quasi-static balance. It is a posing aid, not a rigid-body simulator.
 """
 import bpy
 import importlib
+import math
 import numpy as np
 from mathutils import Matrix, Quaternion, Vector
 
@@ -83,6 +84,11 @@ class LivePose:
             for key, name in {**self.controller_bones, **self.balance_bones}.items()
         }
         self.authored_targets = {}
+        self.step_source_side = None
+        self.generated_step_key = None
+        self.generated_step_base = None
+        self.generated_step_target = None
+        self.initial_target_matrices = {}
         self.initial_world_controls = {
             key: self._world_control_position(self.rig.pose.bones[name])
             for key, name in self.controller_bones.items()
@@ -133,6 +139,7 @@ class LivePose:
         self.collection.objects.link(obj)
         obj[TAG] = True
         obj.matrix_world = matrix.copy()
+        self.initial_target_matrices[key] = matrix.copy()
         obj.empty_display_type = shape
         obj.empty_display_size = self.height * 0.045
         obj.show_in_front = True
@@ -213,6 +220,102 @@ class LivePose:
                 active.append(side)
                 points[side] = support.matrix_world.translation.copy()
         return active, points
+
+    def _restore_generated_step(self):
+        key = self.generated_step_key
+        if not key:
+            return
+        side = key.split("_")[0]
+        matrix = (self.generated_step_base.copy()
+                  if self.generated_step_base is not None
+                  else self.initial_target_matrices.get(key))
+        if matrix is not None:
+            matrix = matrix.copy()
+            obj = self.controls.get(side)
+            if obj:
+                obj.matrix_world = matrix
+                self.display[key] = matrix.copy()
+            self._place_controller(key, matrix.translation)
+        self.generated_step_key = None
+        self.generated_step_base = None
+        self.generated_step_target = None
+
+    def _apply_reciprocal_step(self, edited, active):
+        """Make the opposite ARP foot swing when a grounded foot is dragged."""
+        edited_feet = [key for key in edited if key in {"left_foot", "right_foot"}]
+        if not self.scene.bodymove_reactive_step_assist:
+            if self.generated_step_key in edited_feet:
+                self.generated_step_key = None
+                self.generated_step_base = None
+                self.generated_step_target = None
+            else:
+                self._restore_generated_step()
+            self.step_source_side = None
+            return
+
+        if len(edited_feet) > 1:
+            if self.generated_step_key in edited_feet:
+                self.generated_step_key = None
+                self.generated_step_base = None
+                self.generated_step_target = None
+            else:
+                self._restore_generated_step()
+            self.step_source_side = None
+            return
+        if edited_feet:
+            key = edited_feet[0]
+            side = key.split("_")[0]
+            if self.step_source_side != side:
+                # The user has taken over the foot that was previously moving
+                # automatically. Keep that new input and switch the swing side.
+                if self.generated_step_key == key:
+                    self.generated_step_key = None
+                    self.generated_step_base = None
+                    self.generated_step_target = None
+                else:
+                    self._restore_generated_step()
+                if self.step_source_side:
+                    self.authored_targets.pop(self.step_source_side + "_foot", None)
+                self.step_source_side = side
+
+        side = self.step_source_side
+        if side is None:
+            return
+        source_key = side + "_foot"
+        source_target = self.authored_targets.get(source_key)
+        if source_target is None:
+            return
+        source_initial = self.initial_world_controls[source_key]
+        delta = Vector(source_target) - source_initial
+        delta.z = 0.0
+        distance = delta.length
+        opposite_side = "right" if side == "left" else "left"
+        opposite_key = opposite_side + "_foot"
+
+        # Only create a counter-step while the user-led foot is still a ground
+        # contact. If it is lifted, leave the opposite foot planted as support.
+        if side not in active or distance < self.height * 0.025:
+            self._restore_generated_step()
+            return
+
+        if self.generated_step_key != opposite_key:
+            self._restore_generated_step()
+            self.generated_step_key = opposite_key
+            self.generated_step_base = self.controls[opposite_side].matrix_world.copy()
+
+        max_travel = self.height * 0.22
+        progress = min(1.0, max(0.0, (distance - self.height * 0.025) /
+                                max(max_travel - self.height * 0.025, 1e-6)))
+        travel = max_travel * progress
+        lift = self.height * 0.075 * math.sin(math.pi * progress)
+        target = self.generated_step_base.copy()
+        target.translation += -delta.normalized() * travel
+        target.translation.z += lift
+        self._place_controller(opposite_key, target.translation)
+        obj = self.controls[opposite_side]
+        obj.matrix_world = target
+        self.display[opposite_key] = target.copy()
+        self.generated_step_target = target.translation.copy()
 
     def _apply_target_follow(self):
         """Move the shared body root in response to persistent user targets."""
@@ -458,11 +561,16 @@ class LivePose:
             self.user_has_edited_target = True
         for key, obj in edited.items():
             self.authored_targets[key] = obj.matrix_world.translation.copy()
+        step_edits = dict(edited)
+        step_edits.update((key, None) for key in pose_edits
+                          if key in {"left_foot", "right_foot"})
         self._authored_pelvis = self._authored_pelvis or "pelvis" in edited or "pelvis" in pose_edits
         self._authored_torso = self._authored_torso or "torso" in edited or "torso" in pose_edits
         errors = {}
         for key, obj in edited.items():
             errors[key] = self._place_controller(key, obj.matrix_world.translation)
+        active, points = self._active_supports()
+        self._apply_reciprocal_step(step_edits, active)
         active, points = self._active_supports()
         self._recover_balance_pose(active)
         self._apply_target_follow()
@@ -475,6 +583,8 @@ class LivePose:
         # Preserve every user-placed control while the shared body follows.
         for key, target in self.authored_targets.items():
             self._place_controller(key, target)
+        if self.generated_step_key and self.generated_step_target is not None:
+            self._place_controller(self.generated_step_key, self.generated_step_target)
         errors = {
             key: float(np.linalg.norm(
                 np.asarray(target, dtype=float) -
@@ -495,6 +605,8 @@ class LivePose:
                 status += " | balance incomplete"
         if errors and max(errors.values()) > self.height * 0.005:
             status += " | target limited"
+        if self.generated_step_key:
+            status += " | counter-step: " + self.generated_step_key.split("_")[0].title()
         self.scene.bodymove_reactive_status = status
         self.last_basis = {
             key: self.rig.pose.bones[name].matrix_basis.copy()

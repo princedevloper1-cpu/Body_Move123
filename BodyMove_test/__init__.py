@@ -6202,6 +6202,13 @@ class BODYMOVE_PT_Main(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
+        tabs = layout.row(align=True)
+        tabs.prop(scene, "bodymove_panel_tab", expand=True)
+        layout.separator()
+        if scene.bodymove_panel_tab == "AUTOPHYSICS":
+            BODYMOVE_AutoPhysicsUI.draw(layout, context)
+            return
+
         armature = (
             scene.bodymove_armature_object
         )
@@ -6253,9 +6260,6 @@ class BODYMOVE_PT_Main(bpy.types.Panel):
         # -------------------------------------------------
         # 2. COM + FULCRUM STATUS
         # -------------------------------------------------
-
-        reactive.draw(layout, scene)
-        balance_preview.draw(layout, scene)
 
         mass_points = helpers(
             scene,
@@ -6574,38 +6578,16 @@ class BODYMOVE_PT_Main(bpy.types.Panel):
             )
 
 
-class BODYMOVE_PT_Locomotion(bpy.types.Panel):
-    """Motion tools nested inside the existing BodyMove sidebar panel."""
-    bl_label = "Locomotion"
-    bl_idname = "BODYMOVE_PT_locomotion"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "BodyMove"
-    bl_parent_id = "BODYMOVE_PT_main"
-    bl_options = {"DEFAULT_CLOSED"}
+class BODYMOVE_AutoPhysicsUI:
+    """Draw AutoPhysics content directly below the matching BodyMove tab."""
 
-    def draw(self, context):
-        layout = self.layout
+    @staticmethod
+    def draw(layout, context):
         scene = context.scene
         armature = scene.bodymove_armature_object
 
-        walk = layout.box()
-        walk.label(text="In-Place Walk Cycle", icon="ANIM_DATA")
-        columns = walk.row(align=True).column_flow(columns=2, align=True)
-        columns.prop(scene, "bodymove_walk_speed", text="Speed")
-        columns.prop(scene, "bodymove_walk_stride", text="Stride")
-        columns.prop(scene, "bodymove_walk_cycles", text="Cycles")
-        columns.prop(scene, "bodymove_walk_forward_axis", text="Forward")
-        cadence = 60.0 * scene.bodymove_walk_speed / max(scene.bodymove_walk_stride, 0.05)
-        walk.label(text=f"Cadence: {cadence:.0f} steps/min")
-        walk.label(text="Foot IK targets with pelvis bounce")
-        row = walk.row(align=True)
-        row.operator("bodymove.generate_walk", text="Generate Walk", icon="PLAY")
-        restore = row.row(align=True)
-        restore.enabled = bool(scene.bodymove_walk_action_name)
-        restore.operator("bodymove.restore_walk_action", text="Restore", icon="LOOP_BACK")
-        if scene.bodymove_walk_action_name:
-            walk.label(text=f"Action: {scene.bodymove_walk_action_name}", icon="ACTION")
+        reactive.draw(layout, scene)
+        balance_preview.draw(layout, scene)
 
         intro = layout.box()
         intro.label(text="Motion Preview & Bake", icon="ANIM_DATA")
@@ -6837,13 +6819,21 @@ classes = (
     BODYMOVE_OT_GenerateWalk,
     BODYMOVE_OT_RestoreWalkAction,
     BODYMOVE_PT_Main,
-    BODYMOVE_PT_Locomotion,
 )
 
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+
+    bpy.types.Scene.bodymove_panel_tab = EnumProperty(
+        name="BodyMove Tab",
+        items=(
+            ("SETUP", "Setup", "Rig mapping, mass points and COM setup", "ARMATURE_DATA", 0),
+            ("AUTOPHYSICS", "AutoPhysics", "Balance diagnostics and animation physics", "PHYSICS", 1),
+        ),
+        default="SETUP",
+    )
 
     bpy.types.Scene.bodymove_source_object = (
         PointerProperty(
@@ -7849,6 +7839,7 @@ def unregister():
         )
 
     props = (
+        "bodymove_panel_tab",
         "bodymove_walk_speed",
         "bodymove_walk_stride",
         "bodymove_walk_cycles",

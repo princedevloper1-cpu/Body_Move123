@@ -43,6 +43,74 @@ def margin(point, supports):
     return radius-(point-q).length
 
 
+def classify_contact_track(samples, contact_tolerance, motion_tolerance, fps):
+    """Build a frame-by-frame foot contact map from sampled world positions.
+
+    Distances and thresholds use Blender scene units. A planted anchor stays
+    fixed for the duration of a contact, so slow cumulative foot drift is
+    reported as slip instead of being mistaken for a stable fulcrum.
+    """
+    if not samples:
+        return []
+    if fps <= 0:
+        raise ValueError('FPS must be positive to classify foot contacts')
+
+    positions = [sample['position'] for sample in samples]
+    velocities = []
+    for i, position in enumerate(positions):
+        if len(positions) == 1:
+            velocity = Vector()
+        elif i == 0:
+            velocity = (positions[1] - position) * fps
+        elif i == len(positions) - 1:
+            velocity = (position - positions[i - 1]) * fps
+        else:
+            velocity = (positions[i + 1] - positions[i - 1]) * (fps * 0.5)
+        velocities.append(velocity)
+
+    # This matches the existing stability tolerance, which is authored as a
+    # displacement per frame at 24 FPS and is converted to scene-units/second.
+    speed_limit = max(motion_tolerance, 0.0001) * 24.0
+    contact_limit = max(contact_tolerance, 0.0001)
+    was_contact = False
+    anchor = None
+    results = []
+
+    for index, (sample, velocity) in enumerate(zip(samples, velocities)):
+        # A small release hysteresis prevents noisy markers flickering at the
+        # contact boundary after the foot has landed.
+        limit = contact_limit * (1.5 if was_contact else 1.0)
+        touching = sample['clearance'] <= limit
+        state = 'AIRBORNE'
+        contact = False
+        current = sample['position']
+
+        if touching:
+            contact = True
+            if not was_contact:
+                anchor = current.copy()
+                state = 'LANDING' if index > 0 else 'STANCE'
+            else:
+                drifted = anchor is not None and (current - anchor).length > contact_limit
+                moving = velocity.length > speed_limit
+                state = 'SLIP' if drifted or moving else 'STANCE'
+        elif was_contact:
+            state = 'LIFTOFF'
+            anchor = None
+
+        results.append({
+            'state': state,
+            'contact': contact,
+            'position': current.copy(),
+            'anchor': anchor.copy() if anchor is not None else None,
+            'clearance': sample['clearance'],
+            'velocity': velocity.copy(),
+            'speed': velocity.length,
+        })
+        was_contact = contact
+    return results
+
+
 def clear():
     for obj in list(bpy.data.objects):
         if obj.get(TAG):
@@ -81,14 +149,14 @@ def sample(scene):
     masses=list(api.helpers(scene,api.MASS_POINT))
     total=sum(max(0,float(p.get(api.MASS,0))) for p in masses)
     if total<=0: raise ValueError('No positive mass points')
-    feet=[api.support_by_role(scene,s+'_FOOT') for s in ('LEFT','RIGHT')]
-    feet=[p for p in feet if p is not None]
-    if len(feet)!=2: raise ValueError('Both foot support points are required')
+    feet={role:api.support_by_role(scene,role) for role in ('LEFT_FOOT','RIGHT_FOOT')}
+    if any(foot is None for foot in feet.values()):
+        raise ValueError('Both foot support points are required')
     frame,subframe=scene.frame_current,scene.frame_subframe
     rig=scene.bodymove_armature_object
     pose=api.reactive.pose_basis(rig)
     flags=scene.bodymove_live_analysis,scene.bodymove_physics_enabled,api.reactive._BUSY
-    positions=[]; support_frames=[]
+    positions=[]; foot_samples={role:[] for role in ('LEFT_FOOT','RIGHT_FOOT')}
     try:
         scene.bodymove_live_analysis=False
         scene.bodymove_physics_enabled=False
@@ -98,20 +166,38 @@ def sample(scene):
             graph=bpy.context.evaluated_depsgraph_get()
             p=sum((o.evaluated_get(graph).matrix_world.translation*max(0,float(o.get(api.MASS,0))) for o in masses),Vector())/total
             positions.append(p*scale)
-            supports=[]
-            for foot in feet:
+            for role, foot in feet.items():
                 pos=foot.evaluated_get(graph).matrix_world.translation.copy()
-                if abs(pos.z-floor)<=scene.bodymove_contact_tolerance:
-                    pos.z=floor
-                    supports.append((pos*scale,float(foot.get(api.RADIUS,0.1))*scale*0.3))
-            support_frames.append(supports)
+                foot_samples[role].append({
+                    'position':pos.copy(),
+                    'clearance':abs(pos.z-floor),
+                    'radius':float(foot.get(api.RADIUS,0.1)),
+                })
     finally:
         scene.frame_set(frame,subframe=subframe)
         api.reactive.restore_basis(rig,pose)
         scene.bodymove_live_analysis,scene.bodymove_physics_enabled,api.reactive._BUSY=flags
     rows=estimate(positions,scene.render.fps/scene.render.fps_base,floor*scale,scene.bodymove_balance_gravity)
-    for f,row,supports in zip(range(start,end+1),rows,support_frames):
-        row.update(frame=f,supports=supports,margin=margin(row['capture'],supports))
+    fps=scene.render.fps/scene.render.fps_base
+    tracks={role:classify_contact_track(
+        samples,scene.bodymove_contact_tolerance,
+        scene.bodymove_support_motion_tolerance,fps)
+        for role,samples in foot_samples.items()}
+    for index,(f,row) in enumerate(zip(range(start,end+1),rows)):
+        contacts={role:track[index] for role,track in tracks.items()}
+        supports=[]
+        for role in ('LEFT_FOOT','RIGHT_FOOT'):
+            contact=contacts[role]
+            # Only a planted stance or the landing frame is a reliable support
+            # for this no-friction, flat-ground capture-point approximation.
+            if contact['state'] in {'STANCE','LANDING'}:
+                support=contact['position'].copy()*scale
+                support.z=floor*scale
+                foot=feet[role]
+                radius=float(foot.get(api.RADIUS,0.1))*scale*0.3
+                supports.append((support,radius))
+        row.update(frame=f,contacts=contacts,supports=supports,
+                   margin=margin(row['capture'],supports))
     return rows,scale,floor
 
 
@@ -164,21 +250,38 @@ def build(scene,rows,scale,floor):
     stream=io.StringIO()
     writer=csv.writer(stream)
     writer.writerow(('frame','com_x_m','com_y_m','com_z_m','vx_m_s','vy_m_s','vz_m_s',
-                     'ax_m_s2','ay_m_s2','az_m_s2','capture_x_m','capture_y_m','support_margin_m','contact_count','note'))
+                     'ax_m_s2','ay_m_s2','az_m_s2','capture_x_m','capture_y_m','support_margin_m','support_count',
+                     'left_foot_state','left_anchor_x_m','left_anchor_y_m','left_anchor_z_m','left_speed_m_s',
+                     'right_foot_state','right_anchor_x_m','right_anchor_y_m','right_anchor_z_m','right_speed_m_s','note'))
     for row in rows:
         note='flat-ground constant-height approximation'
-        if not row['supports']: note='no foot support; do not interpret as recovery point'
+        if not row['supports']:
+            states={contact['state'] for contact in row['contacts'].values()}
+            note=('sliding contacts; no stable foot support' if 'SLIP' in states
+                  else 'no foot support; do not interpret as recovery point')
         elif row['capture'] is None: note='invalid COM height'
         elif abs(row['velocity'].z)>0.25 or abs(row['acceleration'].z)>scene.bodymove_balance_gravity*0.2:
             note='vertical motion; constant-height assumption questionable'
         capture=tuple(row['capture'][:2]) if row['capture'] is not None else ('','')
+        contact_values=[]
+        for role in ('LEFT_FOOT','RIGHT_FOOT'):
+            contact=row['contacts'][role]
+            anchor=contact['anchor']*scale if contact['anchor'] is not None else (None,None,None)
+            contact_values.extend((contact['state'],*anchor,contact['speed']*scale))
         writer.writerow((row['frame'],*row['com'],*row['velocity'],*row['acceleration'],*capture,
-                         row['margin'] if row['margin'] is not None else '',len(row['supports']),note))
+                         row['margin'] if row['margin'] is not None else '',len(row['supports']),
+                         *contact_values,note))
     report=bpy.data.texts.new('BodyMove Dynamic Balance.csv')
     report[TAG]=True; report.write(stream.getvalue())
     outside=sum(r['margin'] is not None and r['margin']<0 for r in rows)
-    airborne=sum(not r['supports'] for r in rows)
-    scene.bodymove_balance_status=f"{len(rows)} frames: {outside} capture estimates outside support; {airborne} without foot contact"
+    airborne=sum(all(c['state']=='AIRBORNE' for c in r['contacts'].values()) for r in rows)
+    slips=sum(any(c['state']=='SLIP' for c in r['contacts'].values()) for r in rows)
+    landings=sum(any(c['state']=='LANDING' for c in r['contacts'].values()) for r in rows)
+    liftoffs=sum(any(c['state']=='LIFTOFF' for c in r['contacts'].values()) for r in rows)
+    scene.bodymove_balance_status=(
+        f"{len(rows)} frames: {outside} capture estimates outside support; "
+        f"{slips} slipping; {landings} landings; {liftoffs} liftoffs; {airborne} airborne"
+    )
     api=importlib.import_module(__package__)
     rig=scene.bodymove_armature_object
     pose=api.reactive.pose_basis(rig)
@@ -217,6 +320,7 @@ def draw(layout,scene):
     box.prop(scene,'bodymove_balance_gravity',text='Gravity (m/s²)')
     box.operator(Preview.bl_idname); box.operator(Clear.bl_idname)
     box.label(text='Estimate only - no automatic recovery step')
+    box.label(text='Per-frame foot states, anchors and speed are in the CSV report')
     box.label(text='CSV report in Blender Text Editor; rebuild after edits')
     box.label(text=scene.bodymove_balance_status)
 

@@ -573,6 +573,7 @@ PROPS = ('bodymove_reactive_enabled', 'bodymove_reactive_strength', 'bodymove_re
          'bodymove_reactive_error', 'bodymove_reactive_contact_error',
          'bodymove_reactive_left_arm', 'bodymove_reactive_right_arm', 'bodymove_reactive_pelvis',
          'bodymove_reach_shoulder', 'bodymove_reach_torso', 'bodymove_coupled_pose', 'bodymove_balance_response',
+         'bodymove_reactive_step_assist',
          'bodymove_pose_backend', 'bodymove_whole_freedom', 'bodymove_whole_bone')
 
 
@@ -594,6 +595,7 @@ def draw(layout, scene):
             for key in pair:
                 row.operator('bodymove.reactive_select', text=key.replace('_', ' ').title()).side = key
         box.label(text='Move a BM target or an ARP IK bone in Pose Mode with G')
+        box.prop(scene, 'bodymove_reactive_step_assist', text='Auto Counter-Step')
         box.prop(scene, 'bodymove_balance_response', text='COM Balance Assistance', slider=True)
         box.prop(scene, 'bodymove_reactive_strength', text='Body Response', slider=True)
         row = box.row(align=True)
@@ -643,6 +645,9 @@ def register():
     bpy.types.Scene.bodymove_whole_bone = bpy.props.StringProperty()
     bpy.types.Scene.bodymove_balance_response = bpy.props.FloatProperty(default=1,min=0,max=1,description='COM balance assistance, independent of hand reach')
     bpy.types.Scene.bodymove_coupled_pose = bpy.props.BoolProperty(default=True, description='Jointly refine hand reach and COM balance while preserving planted contacts')
+    bpy.types.Scene.bodymove_reactive_step_assist = bpy.props.BoolProperty(
+        name='Auto Counter-Step', default=True,
+        description='When an Auto-Rig Pro foot is dragged along the ground, swing the opposite foot and let ARP solve its knee')
     for part in ('shoulder', 'torso'):
         setattr(bpy.types.Scene, 'bodymove_reach_'+part, bpy.props.FloatProperty(default=1, min=0, max=1, description='Bounded assistance when an edited hand approaches full arm reach'))
     for part in ('left_arm', 'right_arm', 'pelvis'):
